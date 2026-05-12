@@ -10,5 +10,6 @@ Date: 2024-05-12
 
 from .dataset_loader import DatasetLoader
 from .image_processor import ImageProcessor
+from .feature_extractor import FeatureExtractor
 
-__all__ = ["DatasetLoader", "ImageProcessor"]
+__all__ = ["DatasetLoader", "ImageProcessor", "FeatureExtractor"]

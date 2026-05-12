@@ -5,11 +5,10 @@ Assessment 3 - Macroinvertebrate Image Analysis System
 Software Technology 1 (4483/8995)
 Module: stage2_classification/classifier.py
 Description: MacroinvertebrateClassifier class — trains, evaluates, and
-             persists a Scikit-learn classification pipeline using HOG +
-             colour histogram + texture features. Supports Random Forest,
-             SVM, KNN, and Gradient Boosting. Handles class imbalance via
-             class_weight='balanced'. Includes confusion matrix and
-             classification report visualisations.
+             persists a Scikit-learn classification pipeline. Uses the
+             dedicated FeatureExtractor class for HOG + colour histogram
+             + texture feature engineering. Supports Random Forest, SVM,
+             KNN, and Gradient Boosting with class-weight balancing.
 Date: 2024-05-12
 *******************************
 """
@@ -36,28 +35,32 @@ from sklearn.metrics import (
 )
 
 from utils.dataset_loader import DatasetLoader
-from utils.image_processor import ImageProcessor
+from utils.feature_extractor import FeatureExtractor
 
 
 class MacroinvertebrateClassifier:
     """
     Encapsulates the full classification pipeline for macroinvertebrate images.
 
-    Workflow:
-      1. Feature extraction (HOG + colour histogram + texture)
-      2. Stratified train/test split
-      3. Model training with class-weight balancing
-      4. Evaluation and visualisation
-      5. Model persistence (save/load)
+    Delegates feature engineering to FeatureExtractor, keeping this class
+    focused on model training, evaluation, and persistence.
 
-    The dataset is imbalanced (Gammarus sp: 987 images vs
-    Leptophlebiidae sp: 9 images), so class_weight='balanced'
-    is applied where supported to avoid biasing predictions toward
-    majority classes.
+    Workflow:
+      1. Load images via DatasetLoader
+      2. Extract features via FeatureExtractor
+      3. Stratified train/test split
+      4. Train sklearn Pipeline (StandardScaler + estimator)
+      5. Evaluate with accuracy, classification report, confusion matrix
+      6. 5-fold cross-validation
+      7. Save/load model via pickle
+
+    The dataset is significantly imbalanced (Gammarus sp: 987 images vs
+    Leptophlebiidae sp: 9 images). class_weight='balanced' is applied
+    where supported to prevent the model biasing toward majority classes.
 
     Attributes:
         loader (DatasetLoader): Dataset loader instance.
-        processor (ImageProcessor): Image processor for feature extraction.
+        extractor (FeatureExtractor): Feature extraction instance.
         output_dir (str): Directory where model/results are saved.
         model_name (str): Active model identifier.
         pipeline (Pipeline): Trained sklearn pipeline.
@@ -65,8 +68,6 @@ class MacroinvertebrateClassifier:
         results (dict): Latest evaluation results.
     """
 
-    # Models with class_weight='balanced' where supported to handle
-    # the significant class imbalance in the stream macroinvertebrates dataset.
     AVAILABLE_MODELS = {
         "random_forest": RandomForestClassifier(
             n_estimators=150,
@@ -117,10 +118,10 @@ class MacroinvertebrateClassifier:
                 f"Choose from {list(self.AVAILABLE_MODELS.keys())}."
             )
 
-        self.loader = loader
-        self.processor = ImageProcessor()
-        self.output_dir = output_dir
-        self.model_name = model_name
+        self.loader       = loader
+        self.extractor    = FeatureExtractor()   # dedicated feature engineering class
+        self.output_dir   = output_dir
+        self.model_name   = model_name
         self.pipeline: Pipeline | None = None
         self.label_encoder = LabelEncoder()
         self.results: dict = {}
@@ -133,12 +134,12 @@ class MacroinvertebrateClassifier:
 
     def extract_features(self, images: np.ndarray) -> np.ndarray:
         """
-        Extract a combined feature vector from each image.
+        Extract feature matrix from a batch of images using FeatureExtractor.
 
-        Features per image:
-          - Colour histogram  : 96 dims  (32 bins × 3 channels, L1-normalised)
-          - HOG descriptor    : variable (shape/texture gradients)
-          - Texture statistics: 3 dims   (Laplacian variance, Sobel mean/std)
+        Delegates to FeatureExtractor.extract_batch() which combines:
+          - Colour histogram (96 dims)
+          - HOG descriptor  (~1764 dims)
+          - Texture stats   (3 dims)
 
         Args:
             images (np.ndarray): Array of shape (N, H, W, 3), uint8.
@@ -146,9 +147,7 @@ class MacroinvertebrateClassifier:
         Returns:
             np.ndarray: Feature matrix of shape (N, D).
         """
-        return np.array([
-            self.processor.extract_all_features(img) for img in images
-        ])
+        return self.extractor.extract_batch(images)
 
     # ------------------------------------------------------------------
     # Training
@@ -162,8 +161,8 @@ class MacroinvertebrateClassifier:
         """
         Load data, extract features, train the model, and evaluate.
 
-        Uses stratified splitting to ensure every class is represented
-        in both train and test sets, even for minority classes.
+        Uses stratified splitting to preserve class proportions in both
+        train and test sets — critical for this imbalanced dataset.
 
         Args:
             test_size (float): Fraction of data reserved for testing.
@@ -173,22 +172,22 @@ class MacroinvertebrateClassifier:
             dict: Evaluation results (accuracy, cv_mean, cv_std, report,
                   confusion_matrix, class_names).
         """
-        # 1. Load all images
+        # 1. Load images
         print(f"[Classifier] Loading {len(self.loader.metadata)} images…")
-        X_raw, y = self.loader.load_all_images(size=image_size)
+        X_raw, y    = self.loader.load_all_images(size=image_size)
         class_names = self.loader.class_names
 
-        # 2. Extract features
+        # 2. Extract features via dedicated FeatureExtractor class
         print("[Classifier] Extracting features…")
         X = self.extract_features(X_raw)
 
-        # 3. Stratified split — preserves class proportions in both sets
+        # 3. Stratified split
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=42, stratify=y
         )
 
         # 4. Build sklearn pipeline
-        estimator = self.AVAILABLE_MODELS[self.model_name]
+        estimator    = self.AVAILABLE_MODELS[self.model_name]
         self.pipeline = Pipeline([
             ("scaler",     StandardScaler()),
             ("classifier", estimator),
@@ -198,9 +197,8 @@ class MacroinvertebrateClassifier:
         print(f"[Classifier] Training {self.model_name}…")
         self.pipeline.fit(X_train, y_train)
 
-        # 6. Evaluate on test set
-        #    zero_division=0 silences warnings for minority classes that
-        #    have no predicted samples in the test split.
+        # 6. Evaluate — zero_division=0 handles minority classes with no
+        #    predicted samples in the test split without raising warnings
         y_pred = self.pipeline.predict(X_test)
         acc    = accuracy_score(y_test, y_pred)
         report = classification_report(
@@ -211,10 +209,8 @@ class MacroinvertebrateClassifier:
         )
         cm = confusion_matrix(y_test, y_pred)
 
-        # 7. 5-fold cross-validation on full dataset
-        cv_scores = cross_val_score(
-            self.pipeline, X, y, cv=5, scoring="accuracy"
-        )
+        # 7. 5-fold cross-validation
+        cv_scores = cross_val_score(self.pipeline, X, y, cv=5, scoring="accuracy")
 
         self.results = {
             "model_name":       self.model_name,
@@ -256,9 +252,9 @@ class MacroinvertebrateClassifier:
         if self.pipeline is None:
             raise RuntimeError("Model not trained. Call train() or load_model() first.")
 
-        feat       = self.processor.extract_all_features(image).reshape(1, -1)
-        pred_idx   = self.pipeline.predict(feat)[0]
-        probs      = self.pipeline.predict_proba(feat)[0]
+        feat        = self.extractor.extract(image).reshape(1, -1)
+        pred_idx    = self.pipeline.predict(feat)[0]
+        probs       = self.pipeline.predict_proba(feat)[0]
         class_names = self.loader.class_names
 
         predicted_class = class_names[pred_idx]
@@ -272,12 +268,7 @@ class MacroinvertebrateClassifier:
     # ------------------------------------------------------------------
 
     def plot_confusion_matrix(self) -> str:
-        """
-        Save a heat-map of the confusion matrix from the last training run.
-
-        Returns:
-            str: Path to saved figure.
-        """
+        """Save confusion matrix heat-map. Returns path to saved figure."""
         if not self.results:
             raise RuntimeError("No results available. Call train() first.")
 
@@ -285,11 +276,9 @@ class MacroinvertebrateClassifier:
         class_names = self.results["class_names"]
 
         fig, ax = plt.subplots(figsize=(12, 9))
-        sns.heatmap(
-            cm, annot=True, fmt="d", cmap="Blues",
-            xticklabels=class_names, yticklabels=class_names,
-            linewidths=0.4, ax=ax,
-        )
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                    xticklabels=class_names, yticklabels=class_names,
+                    linewidths=0.4, ax=ax)
         ax.set_title(
             f"Confusion Matrix — {self.model_name.replace('_', ' ').title()}\n"
             f"Test Accuracy: {self.results['accuracy']:.2%}",
@@ -306,26 +295,17 @@ class MacroinvertebrateClassifier:
         return path
 
     def plot_class_report(self) -> str:
-        """
-        Bar chart of per-class precision, recall, and F1-score.
-
-        Returns:
-            str: Path to saved figure.
-        """
+        """Save per-class precision/recall/F1 bar chart. Returns path."""
         if not self.results:
             raise RuntimeError("No results available. Call train() first.")
 
         report      = self.results["report"]
         class_names = self.results["class_names"]
 
-        metrics = {
-            cls: {
-                "Precision": report[cls]["precision"],
-                "Recall":    report[cls]["recall"],
-                "F1":        report[cls]["f1-score"],
-            }
-            for cls in class_names
-        }
+        metrics = {cls: {"Precision": report[cls]["precision"],
+                         "Recall":    report[cls]["recall"],
+                         "F1":        report[cls]["f1-score"]}
+                   for cls in class_names}
         df    = pd.DataFrame(metrics).T
         x     = np.arange(len(class_names))
         width = 0.26
@@ -338,10 +318,8 @@ class MacroinvertebrateClassifier:
         ax.set_xticklabels(class_names, rotation=35, ha="right", fontsize=8)
         ax.set_ylim(0, 1.2)
         ax.set_ylabel("Score")
-        ax.set_title(
-            f"Per-Class Metrics — {self.model_name.replace('_', ' ').title()}",
-            fontsize=13, fontweight="bold",
-        )
+        ax.set_title(f"Per-Class Metrics — {self.model_name.replace('_', ' ').title()}",
+                     fontsize=13, fontweight="bold")
         ax.legend()
         ax.axhline(0.8, color="gray", linestyle="--", linewidth=0.8)
         plt.tight_layout()
@@ -351,15 +329,9 @@ class MacroinvertebrateClassifier:
         return path
 
     def plot_feature_importance(self) -> str | None:
-        """
-        Bar chart of top-20 feature importances (Random Forest / GB only).
-
-        Returns:
-            str | None: Path to saved figure, or None if not supported.
-        """
+        """Save top-20 feature importance chart (RF/GB only). Returns path or None."""
         if not self.results or self.pipeline is None:
             return None
-
         estimator = self.pipeline.named_steps["classifier"]
         if not hasattr(estimator, "feature_importances_"):
             return None
@@ -383,35 +355,20 @@ class MacroinvertebrateClassifier:
     # ------------------------------------------------------------------
 
     def save_model(self, filename: str = "model.pkl") -> str:
-        """
-        Serialise the trained pipeline to disk using pickle.
-
-        Args:
-            filename (str): Output filename inside output_dir.
-
-        Returns:
-            str: Full path to saved model file.
-        """
+        """Serialise trained pipeline to disk. Returns saved path."""
         if self.pipeline is None:
             raise RuntimeError("No trained model to save.")
         path = os.path.join(self.output_dir, filename)
         with open(path, "wb") as f:
-            pickle.dump({
-                "pipeline":    self.pipeline,
-                "label_encoder": self.label_encoder,
-                "model_name":  self.model_name,
-                "class_names": self.loader.class_names,
-            }, f)
+            pickle.dump({"pipeline": self.pipeline,
+                         "label_encoder": self.label_encoder,
+                         "model_name": self.model_name,
+                         "class_names": self.loader.class_names}, f)
         print(f"[Classifier] Model saved → {path}")
         return path
 
     def load_model(self, filepath: str) -> None:
-        """
-        Load a previously saved pipeline from disk.
-
-        Args:
-            filepath (str): Path to the .pkl model file.
-        """
+        """Load a previously saved pipeline from disk."""
         with open(filepath, "rb") as f:
             data = pickle.load(f)
         self.pipeline      = data["pipeline"]
@@ -424,24 +381,19 @@ class MacroinvertebrateClassifier:
     # ------------------------------------------------------------------
 
     def get_results_text(self) -> str:
-        """
-        Return a formatted text summary of the last training run.
-
-        Returns:
-            str: Multi-line results summary.
-        """
+        """Return formatted text summary of the last training run."""
         if not self.results:
             return "No training results available."
 
         lines = [
-            f"=== Classification Results ===",
+            "=== Classification Results ===",
             f"Model         : {self.results['model_name'].replace('_', ' ').title()}",
             f"Test Accuracy : {self.results['accuracy']:.4f}",
             f"CV Accuracy   : {self.results['cv_mean']:.4f} ± {self.results['cv_std']:.4f}",
             "",
             "Per-class metrics (P=Precision, R=Recall, F1=F1-Score):",
-            f"  Note: Classes with very few images (e.g. Leptophlebiidae sp: 9 images)",
-            f"        may show 0.00 scores due to insufficient test samples.",
+            "  Note: Classes with very few images (e.g. Leptophlebiidae sp: 9 images)",
+            "        may show 0.00 scores due to insufficient test samples.",
             "",
         ]
         for cls in self.results["class_names"]:
