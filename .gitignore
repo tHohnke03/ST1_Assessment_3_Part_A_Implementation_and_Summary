@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Saved model (large binary — regenerates in seconds via run_classifier.py)
+outputs/models/model.pkl
+
+# Jupyter
+.ipynb_checkpoints/
+
+# NOTE: data/images/ is intentionally NOT ignored — dataset is included in repo
