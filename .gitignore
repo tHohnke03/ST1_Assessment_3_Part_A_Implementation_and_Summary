@@ -27,3 +27,4 @@ outputs/models/model.pkl
 .ipynb_checkpoints/
 
 # NOTE: data/images/ is intentionally NOT ignored — dataset is included in repo
+data/images/
